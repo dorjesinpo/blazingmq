@@ -209,15 +209,19 @@ BALL_LOG_SET_NAMESPACE_CATEGORY("MQBA.CLIENTSESSION");
 
 const int k_NAGLE_PACKET_SIZE = 1024 * 1024;  // 1MB
 
-/// This method does nothing; it is just used so that we can control when
-/// the session can be destroyed, during the shutdown flow, by binding the
-/// specified `handle` (which is a shared_ptr to the session itself) to
-/// events being enqueued to the dispatcher and let it die `naturally` when
-/// all router threads are drained up to the event.
+/// This method does nothing other than calling the 'initiateShutdown' callback
+/// if it is present; it is just used so that we can control when the session
+/// can be destroyed, during the shutdown flow, by binding the specified
+/// `session` (which is a shared_ptr to the session itself) to events being
+/// enqueued to the dispatcher and let it die `naturally` when all threads are
+/// drained up to the event.
 void sessionHolderDummy(
+    const mqba::ClientSession::ShutdownCb& shutdownCallback,
     BSLS_ANNOTATION_UNUSED const bsl::shared_ptr<void>& session)
 {
-    // NOTHING
+    if (shutdownCallback) {
+        shutdownCallback();
+    }
 }
 
 /// Create the queue stats datum associated with the specified `statContext`
@@ -709,9 +713,10 @@ void ClientSession::tearDownAllQueuesDone(const bsl::shared_ptr<void>& session)
     // by having the 'handle' go out of scope.  This dispatcher event must be
     // of type 'e_DISPATCHER' to make sure this client will not be added to the
     // dispatcher's flush list, since it is being destroyed.
-    dispatcher()->execute(bdlf::BindUtil::bind(&sessionHolderDummy, session),
-                          this,
-                          mqbi::DispatcherEventType::e_DISPATCHER);
+    dispatcher()->execute(
+        bdlf::BindUtil::bind(&sessionHolderDummy, d_shutdownCallback, session),
+        this,
+        mqbi::DispatcherEventType::e_DISPATCHER);
 }
 
 void ClientSession::onHandleConfigured(
@@ -836,12 +841,30 @@ void ClientSession::initiateShutdownDispatched(
     BALL_LOG_INFO << description()
                   << ": initiateShutdownDispatched. Timeout: " << timeout;
 
-    if (d_operationState != e_RUNNING) {
-        // This means the client is disconnected.  No need to wait for the
-        // unconfirmed messages.
+    if (d_operationState == e_DISCONNECTED || d_operationState == e_DEAD) {
+        // The client is disconnected.  No need to wait for tearDown.
         callback();
         return;  // RETURN
     }
+    if (d_operationState == e_SHUTTING_DOWN) {
+        // More than one cluster calls 'initiateShutdown'?
+        callback();
+        return;  // RETURN
+    }
+
+    // Wait for tearDown.
+    d_shutdownCallback = callback;
+
+    if (d_operationState == e_DISCONNECTING) {
+        // Not teared down yet. No need to wait for unconfirmed messages.
+        // Wait for tearDown.
+
+        closeChannel();
+        return;  // RETURN
+    }
+
+    // Wait for unconfirmed messages.
+    // Wait for tearDown.
 
     d_operationState = e_SHUTTING_DOWN;
 
@@ -863,7 +886,10 @@ void ClientSession::initiateShutdownDispatched(
 
     // Check unconfirmed messages once all the handles are deconfigured
     ShutdownContextSp context;
-    context.createInplace(d_state.d_allocator_p, callback, timeout);
+    context.createInplace(d_state.d_allocator_p,
+                          bdlf::BindUtil::bind(&ClientSession::closeChannel,
+                                               this),
+                          timeout);
 
     d_shutdownChain.appendInplace(
         bdlf::BindUtil::bind(&ClientSession::checkUnconfirmed,
@@ -1052,6 +1078,20 @@ void ClientSession::finishCheckUnconfirmedDispatched(
                                            d_self.acquireWeak()),
             shutdownCtx,
             mwcu::NoOp()));
+}
+
+void ClientSession::closeChannel()
+{
+    // executed by *ANY* thread
+
+    // Assume thread-safe read-only access to 'description()' and 'channel()'
+
+    BALL_LOG_INFO << description() << ": Closing channel "
+                  << channel()->peerUri();
+
+    // Assume safe to call 'mwcio::Channel::close' on already closed channel.
+
+    channel()->close();
 }
 
 void ClientSession::processDisconnectAllQueues(
@@ -2497,6 +2537,7 @@ ClientSession::ClientSession(
 , d_scheduler_p(scheduler)
 , d_periodicUnconfirmedCheckHandler()
 , d_shutdownChain(allocator)
+, d_shutdownCallback()
 {
     // Register this client to the dispatcher
     mqbi::Dispatcher::ProcessorHandle processor = dispatcher->registerClient(
@@ -2723,7 +2764,13 @@ void ClientSession::tearDown(const bsl::shared_ptr<void>& session,
 {
     // executed by the *IO* thread
 
+    // PRECONDITIONS
+    BSLS_ASSERT_SAFE(!dispatcher()->inDispatcherThread(this));
+
     BALL_LOG_INFO << description() << ": tearDown";
+
+    // This relies on 'tearDown' being called once
+    BSLS_ASSERT_SAFE(d_self.isValid());
 
     // Cancel the reads on the channel
     d_channel_sp->cancelRead();
